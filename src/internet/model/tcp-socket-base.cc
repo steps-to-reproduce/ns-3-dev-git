@@ -58,6 +58,7 @@
 #include "tcp-option-sack.h"
 #include "tcp-congestion-ops.h"
 #include "tcp-recovery-ops.h"
+#include "tcp-tlp.h"
 
 #include <math.h>
 #include <algorithm>
@@ -117,6 +118,14 @@ TcpSocketBase::GetTypeId (void)
                    BooleanValue (false),
                    MakeBooleanAccessor (&TcpSocketBase::m_dsackEnabled),
                    MakeBooleanChecker ())
+    .AddAttribute ("Rack", "Enable or disable RACK option",
+                  BooleanValue (false),
+                  MakeBooleanAccessor (&TcpSocketBase::m_rackEnabled),
+                  MakeBooleanChecker ())
+    .AddAttribute ("Tlp", "Enable or disable TLP option",
+                  BooleanValue (false),
+                  MakeBooleanAccessor (&TcpSocketBase::m_tlpEnabled),
+                  MakeBooleanChecker ())
     .AddAttribute ("MinRto",
                    "Minimum retransmit timeout value",
                    TimeValue (Seconds (1.0)), // RFC 6298 says min RTO=1 sec, but Linux uses 200ms.
@@ -251,6 +260,8 @@ TcpSocketBase::TcpSocketBase (void)
   m_rxBuffer = CreateObject<TcpRxBuffer> ();
   m_txBuffer = CreateObject<TcpTxBuffer> ();
   m_tcb      = CreateObject<TcpSocketState> ();
+  m_rack     = CreateObject<TcpRack> ();
+  m_tlp     = CreateObject<TcpTlp> ();
 
   m_sndFack = 0;
   m_retranData = 0;
@@ -339,6 +350,8 @@ TcpSocketBase::TcpSocketBase (const TcpSocketBase& sock)
     m_timestampToEcho (sock.m_timestampToEcho),
     m_fackEnabled (sock.m_fackEnabled),
     m_dsackEnabled (sock.m_dsackEnabled),
+    m_rackEnabled (sock.m_rackEnabled),
+    m_tlpEnabled (sock.m_tlpEnabled),
     m_recover (sock.m_recover),
     m_retxThresh (sock.m_retxThresh),
     m_limitedTx (sock.m_limitedTx),
@@ -369,6 +382,8 @@ TcpSocketBase::TcpSocketBase (const TcpSocketBase& sock)
   m_txBuffer = CopyObject (sock.m_txBuffer);
   m_rxBuffer = CopyObject (sock.m_rxBuffer);
   m_tcb = CopyObject (sock.m_tcb);
+  m_rack = CopyObject (sock.m_rack);
+  m_tlp = CopyObject (sock.m_tlp);
 
   m_tcb->m_currentPacingRate = m_tcb->m_maxPacingRate;
   m_pacingTimer.SetFunction (&TcpSocketBase::NotifyPacingPerformed, this);
@@ -1607,6 +1622,25 @@ TcpSocketBase::EnterRecovery ()
 }
 
 void
+TcpSocketBase::RackLoss ()
+{
+  NS_LOG_FUNCTION (this);
+  double timeout = 0.0;
+  m_txBuffer->DetectRackLoss (m_rack, &timeout);
+
+  if (m_txBuffer->GetLost () != 0 && m_tcb->m_congState == TcpSocketState::CA_DISORDER)
+    {
+      EnterRecovery ();
+      NS_ASSERT (m_tcb->m_congState == TcpSocketState::CA_RECOVERY);
+    }
+
+  if (timeout > 0)
+    {
+      Simulator::Schedule (Seconds (timeout), &TcpSocketBase::RackLoss, this);
+    }
+}
+
+void
 TcpSocketBase::DupAck ()
 {
   NS_LOG_FUNCTION (this);
@@ -1659,10 +1693,15 @@ TcpSocketBase::DupAck ()
       // Check FACK recovery condition
       uint32_t fack_diff = std::max ((int) 0, ((int) m_sndFack) - ((int) (m_txBuffer->HeadSequence ().GetValue ())));
 
+      // Check for RACK losses
+      if (m_rackEnabled)
+        {
+          RackLoss ();
+        }
       // RFC 6675, Section 5, continuing:
       // ... and take the following steps:
       // (1) If DupAcks >= DupThresh, go to step (4).
-      if ((m_fackEnabled && fack_diff > m_tcb->m_segmentSize * 3)
+      else if ((m_fackEnabled && fack_diff > m_tcb->m_segmentSize * 3)
          || ((m_dupAckCount == m_retxThresh) && (m_highRxAckMark >= m_recover)))
         {
           EnterRecovery ();
@@ -1714,6 +1753,41 @@ TcpSocketBase::ReceivedAck (Ptr<Packet> packet, const TcpHeader& tcpHeader)
 
   SequenceNumber32 ackNumber = tcpHeader.GetAckNumber ();
   SequenceNumber32 oldHeadSequence = m_txBuffer->HeadSequence ();
+
+  // Update RACK parameters
+  if (m_rackEnabled && ackNumber >= oldHeadSequence)
+    {
+      Ptr<const TcpOptionTS> ts = DynamicCast<const TcpOptionTS> (tcpHeader.GetOption (TcpOption::TS));
+      uint32_t tser = ts->GetEcho ();
+      TcpTxItem item;
+      Time rtt = m_rtt->GetEstimate ();
+
+      // Get information of the latest packet (cumulatively)ACKed packet and update RACK parameters
+      if (!scoreboardUpdated)
+        {
+          m_txBuffer->GetPacketInfo (ackNumber, &item);
+          m_rack->UpdateStats (tser, item.m_retrans, item.m_lastSent, ackNumber, m_tcb->m_nextTxSequence, rtt);
+        }
+
+      // Get information of the latest packet (Selectively)ACKed packet and update RACK parameters
+      else
+        {
+          SequenceNumber32 highestSacked;
+          highestSacked = m_txBuffer->GetHighestSacked ();
+          m_txBuffer->GetPacketInfo (highestSacked, &item);
+          m_rack->UpdateStats (tser, item.m_retrans, item.m_lastSent, highestSacked, m_tcb->m_nextTxSequence, rtt);
+        }
+
+      // Check if TCP will be exiting loss recovery
+      bool exiting = false;
+      if (m_tcb->m_congState == TcpSocketState::CA_RECOVERY && m_recover <= ackNumber)
+        {
+          exiting = true;
+        }
+
+      m_rack->UpdateReoWnd (m_reorder, m_dsackSeen, m_tcb->m_nextTxSequence, oldHeadSequence, m_tcb, m_txBuffer->GetSacked (), m_retxThresh, exiting);
+    }
+
   m_txBuffer->DiscardUpTo (ackNumber);
 
   if (ackNumber > oldHeadSequence && (m_tcb->m_ecnState != TcpSocketState::ECN_DISABLED) && (tcpHeader.GetFlags () & TcpHeader::ECE))
@@ -1736,7 +1810,6 @@ TcpSocketBase::ReceivedAck (Ptr<Packet> packet, const TcpHeader& tcpHeader)
     {
       ReceivedData (packet, tcpHeader);
     }
-
   // RFC 6675, Section 5, point (C), try to send more data. NB: (C) is implemented
   // inside SendPendingData
   SendPendingData (m_connected);
@@ -2549,7 +2622,7 @@ TcpSocketBase::SendEmptyPacket (uint8_t flags)
           AddOptionWScale (header);
         }
 
-      if (m_dsackEnabled && !m_sackEnabled)
+      if ((m_dsackEnabled || m_rackEnabled) && !m_sackEnabled)
         {
           m_sackEnabled = true;
         }
@@ -3037,6 +3110,56 @@ TcpSocketBase::UpdateRttHistory (const SequenceNumber32 &seq, uint32_t sz,
         }
     }
 }
+// Triggered when PTO event fires.
+// Sends a probe packet to avoid waiting for RTO to initiate fast recovery.
+void
+TcpSocketBase::PTOTimeout (void)
+{
+    // Computes the number of bytes that can be sent
+    uint32_t availableWindow = AvailableWindow ();
+    uint32_t transmitableData = availableWindow >= m_tcb->m_segmentSize ? m_tcb->m_segmentSize : 0;
+    // Checks if sufficient data is available to fill a segment
+    // Checks if there is enough space in receive buffer
+    SequenceNumber32 next;
+    bool checkConnectionState = m_sackEnabled && m_tcb->m_congState == TcpSocketState::CA_OPEN;
+
+    uint32_t sz = 0;
+    SequenceNumber32 lastPacketSent;
+    if (checkConnectionState && m_txBuffer->Size () > 0)
+    {
+       if(transmitableData > 0)
+        {
+          // Send Probe packet
+          sz = SendDataPacket (m_tcb->m_nextTxSequence, transmitableData, m_connected);
+          // Incrementing the sequence number
+          m_tcb->m_nextTxSequence += sz;
+        }
+       if(sz==0)
+        {
+          lastPacketSent = m_txBuffer->GetLastPacket();
+          // std::cout<<lastPacketSent<<std::endl;
+          // Send Probe packet
+          sz = SendDataPacket (lastPacketSent, m_tcb->m_segmentSize, m_connected);
+    isTlpProbe = true;
+    // Rearm the RTO timer in order to avoid sending back-to-back probe
+    if (m_retxEvent.IsRunning())
+    {
+      m_retxEvent.Cancel();
+    }
+    m_retxEvent = Simulator::Schedule (m_rto, &TcpSocketBase::ReTxTimeout, this);
+        }
+     }
+    //NS_ASSERT(sz>0);
+
+    isTlpProbe = true;
+    // Rearm the RTO timer in order to avoid sending back-to-back probe
+    if (m_retxEvent.IsRunning())
+    {
+      m_retxEvent.Cancel();
+    }
+    m_retxEvent = Simulator::Schedule (m_rto, &TcpSocketBase::ReTxTimeout, this);
+
+}
 
 // Note that this function did not implement the PSH flag
 uint32_t
@@ -3050,7 +3173,7 @@ TcpSocketBase::SendPendingData (bool withAck)
   if (m_endPoint == nullptr && m_endPoint6 == nullptr)
     {
       NS_LOG_INFO ("TcpSocketBase::SendPendingData: No endpoint; m_shutdownSend=" << m_shutdownSend);
-      return false; // Is this the right way to handle this condition?
+      return false; // Is this the rightm_tx way to handle this condition?
     }
 
   uint32_t nPacketsSent = 0;
@@ -3074,24 +3197,19 @@ TcpSocketBase::SendPendingData (bool withAck)
           NS_LOG_INFO ("Timer is not running");
         }
 
-      if (m_tcb->m_congState == TcpSocketState::CA_OPEN
-          && m_state == TcpSocket::FIN_WAIT_1)
+      if (m_tcb->m_congState == TcpSocketState::CA_OPEN && m_state == TcpSocket::FIN_WAIT_1)
         {
           NS_LOG_INFO ("FIN_WAIT and OPEN state; no data to transmit");
           break;
         }
-      // (C.1) The scoreboard MUST be queried via NextSeg () for the
-      //       sequence number range of the next segment to transmit (if
-      //       any), and the given segment sent.  If NextSeg () returns
-      //       failure (no data to send), return without sending anything
-      //       (i.e., terminate steps C.1 -- C.5).
+
       SequenceNumber32 next;
       bool enableRule3 = m_sackEnabled && m_tcb->m_congState == TcpSocketState::CA_RECOVERY;
       if (!m_txBuffer->NextSeg (&next, enableRule3))
-        {
+       {
           NS_LOG_INFO ("no valid seq to transmit, or no data available");
           break;
-        }
+       }
       else
         {
           // It's time to transmit, but before do silly window and Nagle's check
@@ -3154,6 +3272,22 @@ TcpSocketBase::SendPendingData (bool withAck)
                         " sent seq " << m_tcb->m_nextTxSequence <<
                         " size " << sz);
           ++nPacketsSent;
+          bool checkConnectionState = m_sackEnabled && m_tcb->m_congState == TcpSocketState::CA_OPEN;
+          if (m_tlpEnabled && checkConnectionState & !isTlpProbe)
+            {
+              double rto_left = ((Simulator::GetDelayLeft (m_retxEvent).GetSeconds ()));
+             // Schedule TLP timer
+             if (m_tlptimerEvent.IsRunning())
+               {
+                 // Cancel existing timer
+                 m_tlptimerEvent.Cancel();
+               }
+             uint32_t inflight = BytesInFlight ();
+             Time rtt = m_rtt->GetEstimate ();
+             Time m_pto = m_tlp->CalculatePto(rtt,inflight,(rto_left));
+
+             m_tlptimerEvent = Simulator::Schedule (m_pto, &TcpSocketBase::PTOTimeout, this);
+            }
           if (m_tcb->m_pacing)
             {
               NS_LOG_INFO ("Pacing is enabled");
@@ -3166,7 +3300,6 @@ TcpSocketBase::SendPendingData (bool withAck)
                 }
             }
         }
-
       // (C.4) The estimate of the amount of data outstanding in the
       //       network must be updated by incrementing pipe by the number
       //       of octets transmitted in (C.1).
@@ -3439,10 +3572,21 @@ TcpSocketBase::NewAck (SequenceNumber32 const& ack, bool resetRTO)
   // Reset the data retransmission count. We got a new ACK!
   m_dataRetrCount = m_dataRetries;
 
-// Update m_sndFack if possible
-  if (m_fackEnabled && ack.GetValue () > m_sndFack)
+  // Reset reordering flag. We got a new ACK!
+  m_reorder = false;
+
+  // Update m_sndFack if possible
+  if (m_fackEnabled || m_rackEnabled)
     {
-      m_sndFack = ack.GetValue ();
+      if (ack.GetValue () > m_sndFack)
+        {
+          m_sndFack = ack.GetValue ();
+        }
+      // Packet reordering seen
+      else if (ack.GetValue () < m_sndFack)
+        {
+          m_reorder = true;
+        }
     }
 
   if (m_state != SYN_RCVD && resetRTO)
@@ -3458,6 +3602,35 @@ TcpSocketBase::NewAck (SequenceNumber32 const& ack, bool resetRTO)
                     Simulator::Now ().GetSeconds () << " to expire at time " <<
                     (Simulator::Now () + m_rto.Get ()).GetSeconds ());
       m_retxEvent = Simulator::Schedule (m_rto, &TcpSocketBase::ReTxTimeout, this);
+      uint32_t inflight = BytesInFlight ();
+      Time rtt = m_rtt->GetEstimate ();
+
+  // Updating PTO
+  if (m_tlpEnabled)
+    {
+      // Calculate the time left for RTO to expire
+      double rto_left = (Simulator::GetDelayLeft (m_retxEvent).GetSeconds ());
+      // Calculate PTO
+      Time m_pto = m_tlp->CalculatePto(rtt,inflight,(rto_left));
+
+      // Check if condition for scheduling PTO are satisfied
+      // The connection supports SACK [RFC2018]
+      // The connection has no SACKed sequences in the SACK scoreboard
+      // The connection is not in loss recovery
+      bool checkConnectionState = m_sackEnabled && m_tcb->m_congState == TcpSocketState::CA_OPEN;
+
+      if (checkConnectionState && !isTlpProbe)
+        {
+          // Cancel an existing timer if any.
+          if (m_tlptimerEvent.IsRunning()) m_tlptimerEvent.Cancel();
+          // Reschedule TLP timer with an updated PTO
+          m_tlptimerEvent = Simulator::Schedule (m_pto, &TcpSocketBase::PTOTimeout, this);
+        }
+      if (isTlpProbe)
+        {
+          isTlpProbe = false;
+        }
+    }
     }
 
   // Note the highest ACK and tell app to send more
@@ -3524,7 +3697,7 @@ TcpSocketBase::ReTxTimeout ()
     }
 
   NS_LOG_DEBUG ("Checking if Connection is Established");
-  // If all data are received (non-closing socket and nothing to send), just return
+  // If all data are received (non-closing soReTxTimeoutcket and nothing to send), just return
   if (m_state <= ESTABLISHED && m_txBuffer->HeadSequence () >= m_tcb->m_highTxMark && m_txBuffer->Size () == 0)
     {
       NS_LOG_DEBUG ("Already Sent full data" << m_txBuffer->HeadSequence () << " " << m_tcb->m_highTxMark);
@@ -3746,6 +3919,7 @@ TcpSocketBase::CancelAllTimers ()
   m_timewaitEvent.Cancel ();
   m_sendPendingDataEvent.Cancel ();
   m_pacingTimer.Cancel ();
+  m_tlptimerEvent.Cancel();
 }
 
 /* Move TCP to Time_Wait state and schedule a transition to Closed state */
@@ -4020,15 +4194,42 @@ TcpSocketBase::ProcessOptionSack (const Ptr<const TcpOption> option)
 
   Ptr<const TcpOptionSack> s = DynamicCast<const TcpOptionSack> (option);
   TcpOptionSack::SackList list = s->GetSackList ();
+  SequenceNumber32 oldHeadSequence = m_txBuffer->HeadSequence ();
+
+  // Check if the SACK block contains a DSACK
+  if (m_rackEnabled)
+    {
+      if ((list.begin ()->first) < oldHeadSequence)
+        {
+          m_dsackSeen = true;
+
+          // Check if reordering of packets has taken place
+          TcpTxItem item;
+          m_txBuffer->GetPacketInfo (list.begin ()->first, &item);
+          if (item.m_retrans)
+            {
+              m_reorder = true;
+            }
+        }
+      else
+        {
+          m_dsackSeen = false;
+        }
+    }
 
   // Update m_sndFack with the highest sequence number acknowledged from the SACK blocks
-  if (m_fackEnabled)
+  if (m_fackEnabled || m_rackEnabled)
     {
       for (auto it = list.begin (); it!=list.end (); it++)
          {
            if ((it->second).GetValue () > m_sndFack)
              {
                m_sndFack = (it->second).GetValue ();
+             }
+           // Packet reodering seen
+           else if ((it->second).GetValue () < m_sndFack)
+             {
+               m_reorder = true;
              }
          }
     }
